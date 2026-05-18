@@ -10,6 +10,10 @@ from inkline.editor.search_engine import find_matches
 from inkline.editor.tab import EditorTab
 from inkline.themes.theme_manager import THEMES, ThemeManager
 from inkline.utils.file_ops import backup_file, export_file, read_text, write_text
+from inkline.editor.ink_format import build_metadata, load_ink_document, save_ink_document
+from inkline.editor.rich_text_editor import HIGHLIGHT_COLORS, RichTextController
+from inkline.ui.context_menu import build_context_menu
+from inkline.ui.formatting_toolbar import build_toolbar
 from inkline.utils.text_ops import format_json, reading_time_minutes, remove_double_spaces, trim_empty_lines, word_count
 from inkline.workspace.manager import WorkspaceManager
 
@@ -45,6 +49,9 @@ class InklineApp:
         self.main.add(self.sidebar)
         self.center = tk.Frame(self.main)
         self.main.add(self.center)
+        self.toolbar_visible = tk.BooleanVar(value=True)
+        self.toolbar_host = tk.Frame(self.center)
+        self.toolbar_host.pack(fill=tk.X)
         self.notebook = ttk.Notebook(self.center)
         self.notebook.pack(fill=tk.BOTH, expand=True)
         self.status = tk.Label(self.root, anchor="w")
@@ -59,8 +66,10 @@ class InklineApp:
         f = tk.Menu(menu, tearoff=0); menu.add_cascade(label="File", menu=f)
         f.add_command(label="New", command=self._new_tab)
         f.add_command(label="Open", command=self._open_file)
+        f.add_command(label="Open .ink", command=lambda: self._open_file(ink=True))
         f.add_command(label="Save", command=self._save_file)
         f.add_command(label="Save As", command=lambda: self._save_file(save_as=True))
+        f.add_command(label="Save as .ink", command=lambda: self._save_file(force_ink=True))
         f.add_command(label="Rename", command=self._rename_current)
         f.add_command(label="Duplicate", command=self._duplicate_current)
         f.add_separator()
@@ -69,6 +78,11 @@ class InklineApp:
         e = tk.Menu(menu, tearoff=0); menu.add_cascade(label="Edit", menu=e)
         for n,a in [("Undo","<<Undo>>"),("Redo","<<Redo>>"),("Cut","<<Cut>>"),("Copy","<<Copy>>"),("Paste","<<Paste>>")]:
             e.add_command(label=n, command=lambda x=a: self.current_text().event_generate(x))
+        e.add_command(label="Paste as Plain Text", command=self._paste_plain)
+        e.add_separator()
+        e.add_command(label="Mode: Plain Text", command=lambda: self._switch_mode("Plain Text"))
+        e.add_command(label="Mode: Rich Text", command=lambda: self._switch_mode("Rich Text"))
+        e.add_separator()
         e.add_command(label="Find", command=self._find)
         e.add_command(label="Replace", command=self._replace)
         e.add_command(label="Go To Line", command=self._goto_line)
@@ -77,6 +91,7 @@ class InklineApp:
         e.add_command(label="Trim Empty Lines", command=lambda: self._rewrite(trim_empty_lines))
         v = tk.Menu(menu, tearoff=0); menu.add_cascade(label="View", menu=v)
         v.add_checkbutton(label="Word Wrap", command=self._toggle_wrap)
+        v.add_checkbutton(label="Formatting Toolbar", variable=self.toolbar_visible, command=self._toggle_toolbar)
         v.add_checkbutton(label="Focus Mode", command=self._focus_mode)
         v.add_command(label="Zoom In", command=lambda: self._zoom(10))
         v.add_command(label="Zoom Out", command=lambda: self._zoom(-10))
@@ -102,6 +117,7 @@ class InklineApp:
         text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         text.bind("<KeyRelease>", lambda *_: self._on_change())
         text.bind("<ButtonRelease>", lambda *_: self._update_status())
+        text.bind("<Button-3>", self._show_context_menu)
         return frame, text, nums
 
     def _new_tab(self):
@@ -109,6 +125,12 @@ class InklineApp:
         self.notebook.add(frame, text="Untitled")
         tab_id = str(frame)
         frame.text, frame.nums = text, nums
+        frame.controller = RichTextController(text)
+        frame.context_menu = build_context_menu(self.root, self._actions())
+        if not hasattr(self, "toolbar"):
+            self.toolbar = build_toolbar(self.toolbar_host, self._actions())
+            self.toolbar.pack(fill=tk.X)
+        self._bind_rich_shortcuts(text)
         self.tabs[tab_id] = EditorTab()
         self.notebook.select(frame)
 
@@ -121,25 +143,78 @@ class InklineApp:
     def current_tab(self):
         return self.tabs[str(self.current_frame())]
 
-    def _open_file(self):
-        path = filedialog.askopenfilename()
+
+    def _actions(self):
+        c = self.current_frame().controller
+        return {
+            "bold": lambda: c.toggle_tag("bold"), "italic": lambda: c.toggle_tag("italic"), "underline": lambda: c.toggle_tag("underline"),
+            "strike": lambda: c.toggle_tag("strikethrough"), "highlight": c.apply_highlight, "highlights": list(HIGHLIGHT_COLORS.keys()),
+            "text_color": c.apply_text_color, "header": c.apply_header, "clear": c.clear_formatting,
+            "list": c.insert_list, "align": c.align,
+        }
+
+    def _bind_rich_shortcuts(self, text):
+        bind=[("<Control-b>",lambda: self.current_frame().controller.toggle_tag("bold")),("<Control-i>",lambda: self.current_frame().controller.toggle_tag("italic")),
+            ("<Control-u>",lambda: self.current_frame().controller.toggle_tag("underline")),("<Control-Shift-S>",lambda: self.current_frame().controller.toggle_tag("strikethrough")),
+            ("<Control-Alt-Key-1>",lambda: self.current_frame().controller.apply_header(1)),("<Control-Alt-Key-2>",lambda: self.current_frame().controller.apply_header(2)),
+            ("<Control-Alt-Key-3>",lambda: self.current_frame().controller.apply_header(3)),("<Control-Alt-Key-4>",lambda: self.current_frame().controller.apply_header(4)),
+            ("<Control-space>",lambda: self.current_frame().controller.clear_formatting())]
+        for seq, fn in bind:
+            text.bind(seq, lambda e,f=fn:(f(),"break")[1])
+
+    def _toggle_toolbar(self):
+        self.toolbar_host.pack_forget() if not self.toolbar_visible.get() else self.toolbar_host.pack(fill=tk.X, before=self.notebook)
+
+    def _switch_mode(self, mode: str):
+        self.current_tab().mode = mode
+        self._update_status()
+
+    def _open_file(self, ink: bool = False):
+        path = filedialog.askopenfilename(filetypes=[("Inkline Rich Text", "*.ink"), ("All files", "*.*")]) if ink else filedialog.askopenfilename()
         if not path:
             return
         self._new_tab(); tab = self.current_tab(); text = self.current_text()
         tab.path = path; tab.title = Path(path).name
-        text.delete("1.0", tk.END); text.insert("1.0", read_text(path, self.settings["encoding"]))
+        if path.endswith(".ink"):
+            payload = load_ink_document(path)
+            text.delete("1.0", tk.END); text.insert("1.0", payload.get("content", ""))
+            tab.mode = payload.get("mode", "Rich Text")
+            for span in payload.get("tags", []):
+                text.tag_add(span["tag"], span["start"], span["end"])
+                if span["tag"].startswith("fg_") and "foreground" in span:
+                    text.tag_configure(span["tag"], foreground=span["foreground"])
+            text.mark_set(tk.INSERT, payload.get("cursor", "1.0"))
+        else:
+            text.delete("1.0", tk.END); text.insert("1.0", read_text(path, self.settings["encoding"]))
+            tab.mode = "Plain Text"
         self.notebook.tab(self.notebook.select(), text=tab.title)
         self._add_recent(path)
 
-    def _save_file(self, save_as: bool = False):
+    def _save_file(self, save_as: bool = False, force_ink: bool = False):
         tab, text = self.current_tab(), self.current_text()
         if not tab.path or save_as:
-            tab.path = filedialog.asksaveasfilename(defaultextension=".txt")
+            tab.path = filedialog.asksaveasfilename(defaultextension=".ink" if force_ink else ".txt")
             if not tab.path:
                 return
         if Path(tab.path).exists():
             backup_file(tab.path)
-        write_text(tab.path, text.get("1.0", tk.END), self.settings["encoding"], self.settings["line_endings"])
+        if tab.path.endswith(".ink") or force_ink:
+            tags=[]
+            for tag in text.tag_names():
+                if tag=="sel":
+                    continue
+                for rng in text.tag_ranges(tag)[::2]:
+                    pass
+                ranges=text.tag_ranges(tag)
+                for i in range(0,len(ranges),2):
+                    item={"tag":tag,"start":str(ranges[i]),"end":str(ranges[i+1])}
+                    if tag.startswith("fg_"):
+                        item["foreground"]=text.tag_cget(tag,"foreground")
+                    tags.append(item)
+            payload={"metadata":build_metadata(),"mode":tab.mode,"content":text.get("1.0","end-1c"),"tags":tags,"cursor":text.index(tk.INSERT)}
+            save_ink_document(tab.path,payload)
+        else:
+            write_text(tab.path, text.get("1.0", tk.END), self.settings["encoding"], self.settings["line_endings"])
         tab.title = Path(tab.path).name; tab.dirty = False
         self.notebook.tab(self.notebook.select(), text=tab.title)
         self._add_recent(tab.path); self._update_status()
@@ -227,12 +302,24 @@ class InklineApp:
         nums.insert("1.0", "\n".join(map(str, range(1, lines + 1))))
         nums.config(state=tk.DISABLED)
 
+    def _show_context_menu(self, event):
+        text=self.current_text()
+        if text.tag_ranges("sel"):
+            self.current_frame().context_menu.tk_popup(event.x_root, event.y_root)
+
+    def _paste_plain(self):
+        try:
+            data = self.root.clipboard_get()
+            self.current_text().insert(tk.INSERT, data)
+        except tk.TclError:
+            pass
+
     def _update_status(self):
         text = self.current_text().get("1.0", "end-1c")
         idx = self.current_text().index(tk.INSERT)
         tab = self.current_tab()
         ln,col = idx.split(".")
-        self.status.config(text=f"Ln {ln}, Col {int(col)+1} | Chars {len(text)} | Words {word_count(text)} | Read {reading_time_minutes(text)} min | {self.settings['encoding']} | {tab.zoom}% | {self.settings['line_endings']}")
+        self.status.config(text=f"Ln {ln}, Col {int(col)+1} | Chars {len(text)} | Words {word_count(text)} | Read {reading_time_minutes(text)} min | {self.settings['encoding']} | {tab.zoom}% | {self.settings['line_endings']} | {tab.mode}")
 
     def _add_recent(self, path: str):
         if path in self.recent_files:

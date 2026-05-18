@@ -13,3 +13,4 @@ class EditorTab:
     zoom: int = 100
     favorites: bool = False
     tags: list[str] = field(default_factory=list)
+    mode: str = "Plain Text"
