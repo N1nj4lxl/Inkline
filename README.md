@@ -1,4 +1,15 @@
-# Inkline
+# Random Apps
+
+This repository contains **two separate desktop apps**:
+
+1. **Inkline** — a modern lightweight text editor.
+2. **Steam Key Manager** — a GUI utility for organizing and tracking Steam keys.
+
+> These apps are independent. They are not combined into one program.
+
+---
+
+## App 1: Inkline
 
 Simple notes, sharper tools.
 
@@ -317,3 +328,24 @@ Just a fast modern desktop editor built properly.
 # Status
 
 Inkline is currently in active development.
+
+
+---
+
+## App 2: Steam Key Manager
+
+Steam Key Manager is a separate Tkinter desktop app for importing, sorting, and tracking Steam keys.
+
+### Run locally
+
+```bash
+python steam_key_manager.py
+```
+
+### What it does
+
+* Load key lists from file
+* Track available vs used keys
+* Move keys between states
+* Save/export updated key lists
+* Switch between built-in themes
