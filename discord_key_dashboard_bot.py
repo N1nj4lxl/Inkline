@@ -1,14 +1,21 @@
 import asyncio
+import csv
 import json
 import threading
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import discord
 from discord.ext import commands
+
+APP_DIR = Path(__file__).resolve().parent / "dashboard_config"
+APP_DIR.mkdir(exist_ok=True)
+AUTOSAVE_PATH = APP_DIR / "state.json"
+LOG_PATH = APP_DIR / "dashboard.log"
 
 
 @dataclass
@@ -18,23 +25,110 @@ class GuildRoleSnapshot:
     roles: list[tuple[int, str]]
 
 
+@dataclass
+class ClaimEvent:
+    user_id: int
+    username: str
+    key: str
+    timestamp: str
+
+
+@dataclass
+class ServerSettings:
+    prefix: str = "!"
+    allowed_roles: set[int] = field(default_factory=set)
+    default_keys_per_request: int = 1
+    claim_cooldown_hours: int = 24
+
+
 class KeyDistributor:
     def __init__(self):
         self.keys: list[str] = []
         self.claimed: dict[int, list[str]] = defaultdict(list)
+        self.claim_history: list[ClaimEvent] = []
         self.allowed_users: set[int] = set()
-        self.allowed_roles_by_guild: dict[int, set[int]] = defaultdict(set)
         self.default_count = 1
         self.custom_commands: dict[str, str] = {}
+        self.server_settings: dict[int, ServerSettings] = defaultdict(ServerSettings)
+        self.username_cache: dict[int, str] = {}
+        self.last_claim_at: dict[int, str] = {}
+        self.max_claims_per_user = 1
+        self.prevent_duplicate_claim = True
+        self.lock_mode = False
         self.lock = threading.Lock()
 
-    def load_keys_from_file(self, file_path: str):
-        path = Path(file_path)
-        lines = path.read_text(encoding="utf-8").splitlines()
-        clean = [line.strip() for line in lines if line.strip()]
-        deduped = list(dict.fromkeys(clean))
+    def import_preview(self, file_path: str):
+        lines = Path(file_path).read_text(encoding="utf-8").splitlines()
+        stripped = [line.strip() for line in lines]
+        non_empty = [line for line in stripped if line]
+        deduped = list(dict.fromkeys(non_empty))
+        return {
+            "total_lines": len(lines),
+            "empty_removed": len(lines) - len(non_empty),
+            "duplicates_removed": len(non_empty) - len(deduped),
+            "final_count": len(deduped),
+            "keys": deduped,
+        }
+
+    def load_keys(self, keys: list[str]):
         with self.lock:
-            self.keys = deduped
+            self.keys = list(keys)
+
+    def load_allowed_users_from_lines(self, lines: list[str]) -> tuple[int, int]:
+        added = 0
+        skipped = 0
+        with self.lock:
+            for line in lines:
+                clean = line.strip().split(",")[0]
+                if not clean:
+                    continue
+                try:
+                    uid = int(clean)
+                except ValueError:
+                    skipped += 1
+                    continue
+                if uid in self.allowed_users:
+                    skipped += 1
+                else:
+                    self.allowed_users.add(uid)
+                    added += 1
+        return added, skipped
+
+    def can_claim(self, user_id: int, guild_id: int, role_ids: list[int]) -> tuple[bool, str]:
+        with self.lock:
+            if self.lock_mode:
+                return False, "Emergency lock mode is enabled."
+            settings = self.server_settings[guild_id]
+            has_role = any(rid in settings.allowed_roles for rid in role_ids)
+            if user_id not in self.allowed_users and not has_role:
+                return False, "User is not allowed by ID or role."
+            if self.prevent_duplicate_claim and self.claimed.get(user_id):
+                return False, "User already claimed and duplicate protection is enabled."
+            if len(self.claimed.get(user_id, [])) >= self.max_claims_per_user:
+                return False, f"User has reached max claims ({self.max_claims_per_user})."
+            if user_id in self.last_claim_at:
+                last = datetime.fromisoformat(self.last_claim_at[user_id])
+                cooldown_end = last + timedelta(hours=settings.claim_cooldown_hours)
+                if datetime.utcnow() < cooldown_end:
+                    return False, f"Claim cooldown active until {cooldown_end.isoformat(timespec='seconds')} UTC"
+        return True, "User can claim."
+
+    def give_keys(self, user_id: int, username: str, guild_id: int, count: int | None = None) -> tuple[list[str], str]:
+        with self.lock:
+            settings = self.server_settings[guild_id]
+            n = count if count is not None else settings.default_keys_per_request
+            n = max(1, n)
+            if not self.keys:
+                return [], "No keys available."
+            given = self.keys[:n]
+            self.keys = self.keys[n:]
+            self.claimed[user_id].extend(given)
+            self.username_cache[user_id] = username
+            now = datetime.utcnow().isoformat(timespec="seconds")
+            self.last_claim_at[user_id] = now
+            for key in given:
+                self.claim_history.append(ClaimEvent(user_id, username, key, now))
+            return given, "Keys granted."
 
     def save_state(self, file_path: str):
         with self.lock:
@@ -44,11 +138,28 @@ class KeyDistributor:
                 "default_count": self.default_count,
                 "custom_commands": self.custom_commands,
                 "claimed": {str(uid): vals for uid, vals in self.claimed.items()},
-                "allowed_roles_by_guild": {
-                    str(gid): sorted(role_ids) for gid, role_ids in self.allowed_roles_by_guild.items()
+                "username_cache": {str(k): v for k, v in self.username_cache.items()},
+                "claim_history": [e.__dict__ for e in self.claim_history],
+                "server_settings": {
+                    str(gid): {
+                        "prefix": s.prefix,
+                        "allowed_roles": sorted(s.allowed_roles),
+                        "default_keys_per_request": s.default_keys_per_request,
+                        "claim_cooldown_hours": s.claim_cooldown_hours,
+                    }
+                    for gid, s in self.server_settings.items()
                 },
+                "last_claim_at": self.last_claim_at,
+                "max_claims_per_user": self.max_claims_per_user,
+                "prevent_duplicate_claim": self.prevent_duplicate_claim,
+                "lock_mode": self.lock_mode,
             }
-        Path(file_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        path = Path(file_path)
+        if path.exists():
+            stamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M")
+            backup = path.with_name(f"state_backup_{stamp}.json")
+            backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def load_state(self, file_path: str):
         data = json.loads(Path(file_path).read_text(encoding="utf-8"))
@@ -56,578 +167,368 @@ class KeyDistributor:
             self.keys = list(data.get("remaining_keys", []))
             self.allowed_users = {int(u) for u in data.get("allowed_users", [])}
             self.default_count = int(data.get("default_count", 1))
-            loaded_commands = data.get("custom_commands", {})
-            self.custom_commands = {
-                self._normalize_command_name(name): str(response)
-                for name, response in loaded_commands.items()
-                if self._normalize_command_name(name) and str(response).strip()
-            }
-            restored = defaultdict(list)
-            for uid, vals in data.get("claimed", {}).items():
-                restored[int(uid)] = list(vals)
-            self.claimed = restored
-            role_map = defaultdict(set)
-            for gid, role_ids in data.get("allowed_roles_by_guild", {}).items():
-                role_map[int(gid)] = {int(role_id) for role_id in role_ids}
-            self.allowed_roles_by_guild = role_map
-
-    @staticmethod
-    def _normalize_command_name(name: str) -> str:
-        clean = "".join(ch for ch in name.strip().lower() if ch.isalnum() or ch == "_")
-        return clean
-
-    def upsert_custom_command(self, name: str, response: str) -> str:
-        normalized = self._normalize_command_name(name)
-        if not normalized:
-            raise ValueError("Command name must contain letters, numbers, or underscores.")
-        reply = response.strip()
-        if not reply:
-            raise ValueError("Command response cannot be empty.")
-        with self.lock:
-            self.custom_commands[normalized] = reply
-        return normalized
-
-    def remove_custom_command(self, name: str) -> bool:
-        normalized = self._normalize_command_name(name)
-        with self.lock:
-            return self.custom_commands.pop(normalized, None) is not None
-
-    def add_allowed_user(self, user_id: int):
-        with self.lock:
-            self.allowed_users.add(user_id)
-
-    def remove_allowed_user(self, user_id: int):
-        with self.lock:
-            self.allowed_users.discard(user_id)
-
-    def grant_role(self, guild_id: int, role_id: int):
-        with self.lock:
-            self.allowed_roles_by_guild[guild_id].add(role_id)
-
-    def revoke_role(self, guild_id: int, role_id: int):
-        with self.lock:
-            roles = self.allowed_roles_by_guild.get(guild_id)
-            if not roles:
-                return
-            roles.discard(role_id)
-
-    def user_has_role_access(self, guild_id: int, role_ids: list[int]) -> bool:
-        with self.lock:
-            allowed_roles = self.allowed_roles_by_guild.get(guild_id, set())
-            return any(role_id in allowed_roles for role_id in role_ids)
-
-    def give_keys(self, user_id: int, count: int | None = None) -> list[str]:
-        with self.lock:
-            n = count if count is not None else self.default_count
-            n = max(1, n)
-            if not self.keys:
-                return []
-            given = self.keys[:n]
-            self.keys = self.keys[n:]
-            self.claimed[user_id].extend(given)
-            return given
-
-    def summary(self):
-        with self.lock:
-            return {
-                "remaining": len(self.keys),
-                "allowed_count": len(self.allowed_users),
-                "claimed_total": sum(len(v) for v in self.claimed.values()),
-            }
+            self.custom_commands = data.get("custom_commands", {})
+            self.claimed = defaultdict(list, {int(uid): vals for uid, vals in data.get("claimed", {}).items()})
+            self.username_cache = {int(k): v for k, v in data.get("username_cache", {}).items()}
+            self.claim_history = [ClaimEvent(**event) for event in data.get("claim_history", [])]
+            loaded_server_settings = defaultdict(ServerSettings)
+            for gid, values in data.get("server_settings", {}).items():
+                loaded_server_settings[int(gid)] = ServerSettings(
+                    prefix=values.get("prefix", "!"),
+                    allowed_roles={int(v) for v in values.get("allowed_roles", [])},
+                    default_keys_per_request=int(values.get("default_keys_per_request", 1)),
+                    claim_cooldown_hours=int(values.get("claim_cooldown_hours", 24)),
+                )
+            self.server_settings = loaded_server_settings
+            self.last_claim_at = {int(k): v for k, v in data.get("last_claim_at", {}).items()}
+            self.max_claims_per_user = int(data.get("max_claims_per_user", 1))
+            self.prevent_duplicate_claim = bool(data.get("prevent_duplicate_claim", True))
+            self.lock_mode = bool(data.get("lock_mode", False))
 
 
 class BotController:
-    def __init__(self, distributor: KeyDistributor, log_cb, guild_sync_cb):
-        self.distributor = distributor
+    def __init__(self, distributor: KeyDistributor, log_cb, status_cb, guild_sync_cb):
+        self.dist = distributor
         self.log_cb = log_cb
+        self.status_cb = status_cb
         self.guild_sync_cb = guild_sync_cb
         self.loop = None
-        self.thread = None
         self.bot = None
-        self.custom_command_names: set[str] = set()
         self.running = False
 
-    def _build_bot(self, prefix: str):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        bot = commands.Bot(command_prefix=prefix, intents=intents)
-
-        @bot.event
-        async def on_ready():
-            self.log_cb(f"Logged in as {bot.user} (ID: {bot.user.id})")
-            snapshots = []
-            for guild in bot.guilds:
-                me = guild.me
-                if me is None:
-                    continue
-                manageable_roles = [
-                    (role.id, role.name)
-                    for role in guild.roles
-                    if role.position < me.top_role.position and not role.managed
-                ]
-                manageable_roles.sort(key=lambda item: item[1].lower())
-                snapshots.append(
-                    GuildRoleSnapshot(
-                        guild_id=guild.id,
-                        guild_name=f"{guild.name} ({guild.id})",
-                        roles=manageable_roles,
-                    )
-                )
-            self.guild_sync_cb(snapshots)
-
-        @bot.command(name="getkeys")
-        async def get_keys(ctx, count: int | None = None):
-            user_id = ctx.author.id
-            if isinstance(ctx.channel, discord.DMChannel) or ctx.guild is None:
-                await ctx.reply("Use this command inside a server channel.")
-                return
-
-            has_role_access = self.distributor.user_has_role_access(
-                ctx.guild.id, [role.id for role in ctx.author.roles]
-            )
-            if not has_role_access and user_id not in self.distributor.allowed_users:
-                await ctx.reply("You are not allowed to receive keys.")
-                return
-            keys = self.distributor.give_keys(user_id, count)
-            if not keys:
-                await ctx.reply("No keys are available right now.")
-                return
-
-            joined = "\n".join(keys)
-            try:
-                await ctx.author.send(f"Your keys:\n{joined}")
-                await ctx.reply(f"Sent {len(keys)} key(s) to your DM.")
-            except discord.Forbidden:
-                await ctx.reply("I can't DM you. Please open your DMs and try again.")
-
-            self.log_cb(f"Gained keys -> {ctx.author} ({ctx.author.id}): {', '.join(keys)}")
-
-        self._register_custom_commands(bot)
-        return bot
-
-    def _register_custom_commands(self, bot):
-        for command_name in list(self.custom_command_names):
-            cmd = bot.get_command(command_name)
-            if cmd:
-                bot.remove_command(command_name)
-        self.custom_command_names.clear()
-
-        for command_name, response in self.distributor.custom_commands.items():
-            async def custom_reply(ctx, text=response):
-                await ctx.reply(text)
-
-            bot.command(name=command_name)(custom_reply)
-            self.custom_command_names.add(command_name)
-
-    def sync_custom_commands(self):
-        if not self.running or not self.bot or not self.loop:
-            return
-
-        def apply_changes():
-            self._register_custom_commands(self.bot)
-
-        self.loop.call_soon_threadsafe(apply_changes)
+    async def validate_token(self, token: str):
+        intents = discord.Intents.none()
+        bot = commands.Bot(command_prefix="!", intents=intents)
+        try:
+            await bot.login(token)
+            await bot.close()
+            return True, "Token validation successful."
+        except discord.LoginFailure:
+            return False, "Invalid bot token"
+        except Exception as exc:
+            return False, f"Token validation failed: {exc}"
 
     def start(self, token: str, prefix: str):
         if self.running:
-            self.log_cb("Bot is already running.")
+            self.log_cb("[Warning] Bot already running")
+            return
+
+        ok, msg = asyncio.run(self.validate_token(token))
+        if not ok:
+            self.status_cb("Offline")
+            self.log_cb(f"[Error] {msg}")
             return
 
         def runner():
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            self.bot = self._build_bot(prefix)
-            self.running = True
+            intents = discord.Intents.default()
+            intents.message_content = True
+            self.bot = commands.Bot(command_prefix=prefix, intents=intents)
+            self.status_cb("Starting")
+
+            @self.bot.event
+            async def on_ready():
+                self.status_cb("Online")
+                self.log_cb(f"[Success] Logged in as {self.bot.user}")
+                snapshots = []
+                for guild in self.bot.guilds:
+                    snapshots.append(
+                        GuildRoleSnapshot(
+                            guild_id=guild.id,
+                            guild_name=f"{guild.name} ({guild.id})",
+                            roles=[(r.id, r.name) for r in guild.roles if not r.managed],
+                        )
+                    )
+                self.guild_sync_cb(snapshots)
+
+            @self.bot.command(name="getkeys")
+            async def getkeys(ctx, count: int | None = None):
+                if not ctx.guild:
+                    await ctx.reply("Use this command inside a server channel.")
+                    return
+                can, reason = self.dist.can_claim(ctx.author.id, ctx.guild.id, [r.id for r in ctx.author.roles])
+                if not can:
+                    await ctx.reply(reason)
+                    return
+                keys, _ = self.dist.give_keys(ctx.author.id, str(ctx.author), ctx.guild.id, count)
+                if not keys:
+                    await ctx.reply("No keys available.")
+                    return
+                try:
+                    await ctx.author.send("Your keys:\n" + "\n".join(keys))
+                    await ctx.reply(f"Sent {len(keys)} key(s) in DM.")
+                    self.log_cb(f"[Success] Gained keys -> {ctx.author} ({ctx.author.id})")
+                except discord.Forbidden:
+                    await ctx.reply("DM failed. Please enable DMs.")
+                    self.log_cb("[Warning] DM failed for user")
+
             try:
-                self.loop.run_until_complete(self.bot.start(token))
+                self.running = True
+                self.bot.run(token)
             except Exception as exc:
-                self.log_cb(f"Bot crashed: {exc}")
+                self.status_cb("Crashed")
+                self.log_cb(f"[Error] Bot crashed: {exc}")
             finally:
                 self.running = False
+                if self.status_cb:
+                    self.status_cb("Offline")
 
-        self.thread = threading.Thread(target=runner, daemon=True)
-        self.thread.start()
-        self.log_cb("Bot thread started.")
-
-    def stop(self):
-        if not self.running or not self.bot or not self.loop:
-            self.log_cb("Bot is not running.")
-            return
-
-        async def shutdown():
-            await self.bot.close()
-
-        fut = asyncio.run_coroutine_threadsafe(shutdown(), self.loop)
-        try:
-            fut.result(timeout=10)
-            self.log_cb("Bot stopped.")
-        except Exception as exc:
-            self.log_cb(f"Failed to stop bot cleanly: {exc}")
+        threading.Thread(target=runner, daemon=True).start()
 
 
 class Dashboard:
-    THEMES = {
-        "True Dark": {
-            "bg": "#0e0e10",
-            "panel": "#17171c",
-            "input": "#1f2027",
-            "text": "#f5f7ff",
-            "muted": "#adb5d8",
-            "accent": "#6c7bff",
-            "accent_active": "#8d98ff",
-            "border": "#2b2e3a",
-        },
-        "Dark Pink": {
-            "bg": "#140f16",
-            "panel": "#211725",
-            "input": "#2a1e30",
-            "text": "#ffeaf6",
-            "muted": "#ddb3cf",
-            "accent": "#ff4fa3",
-            "accent_active": "#ff79bc",
-            "border": "#3f2a47",
-        },
-    }
-
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Discord Key Distributor Dashboard")
-        self.root.geometry("950x640")
-        self.style = ttk.Style(self.root)
-
+        self.root.title("Discord Key Distributor - Modern Dashboard")
+        self.root.geometry("1300x800")
         self.dist = KeyDistributor()
-        self.controller = BotController(self.dist, self.log, self.sync_guild_tabs)
-
+        self.status_var = tk.StringVar(value="Offline")
         self.token_var = tk.StringVar()
-        self.prefix_var = tk.StringVar(value="!")
-        self.default_count_var = tk.StringVar(value="1")
-        self.user_id_var = tk.StringVar()
-        self.command_name_var = tk.StringVar()
-        self.command_response_var = tk.StringVar()
-        self.theme_var = tk.StringVar(value="True Dark")
-        self.guild_tabs: dict[int, dict] = {}
-
+        self.show_token_var = tk.BooleanVar(value=False)
+        self.search_vars = {name: tk.StringVar() for name in ["keys", "users", "claimed", "roles", "commands"]}
+        self.controller = BotController(self.dist, self.log, self.set_status, self.sync_guilds)
+        self.guild_data = {}
         self._build_ui()
-        self.apply_theme(self.theme_var.get())
-        self.refresh_lists()
+        if AUTOSAVE_PATH.exists():
+            self.dist.load_state(str(AUTOSAVE_PATH))
+        self.refresh_all()
 
     def _build_ui(self):
-        wrapper = ttk.Frame(self.root, padding=10)
-        wrapper.pack(fill="both", expand=True)
+        main = ttk.Frame(self.root, padding=10)
+        main.pack(fill="both", expand=True)
+        sidebar = ttk.Frame(main, width=180)
+        sidebar.pack(side="left", fill="y")
+        body = ttk.Frame(main)
+        body.pack(side="left", fill="both", expand=True, padx=(10, 0))
 
-        top = ttk.LabelFrame(wrapper, text="Bot Controls", padding=8)
-        top.pack(fill="x", pady=(0, 10))
+        self.pages = {}
+        self.page_stack = ttk.Frame(body)
+        self.page_stack.pack(fill="both", expand=True)
 
-        ttk.Label(top, text="Token:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(top, textvariable=self.token_var, show="*", width=60).grid(row=0, column=1, padx=6, sticky="we")
+        for name in ["Dashboard", "Keys", "Users", "Roles", "Commands", "Logs"]:
+            ttk.Button(sidebar, text=name, command=lambda n=name: self.show_page(n)).pack(fill="x", pady=3)
+            frame = ttk.Frame(self.page_stack)
+            frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self.pages[name] = frame
 
-        ttk.Label(top, text="Prefix:").grid(row=0, column=2, padx=(10, 0), sticky="w")
-        ttk.Entry(top, textvariable=self.prefix_var, width=8).grid(row=0, column=3, padx=6, sticky="w")
+        self._build_dashboard_page(self.pages["Dashboard"])
+        self._build_keys_page(self.pages["Keys"])
+        self._build_users_page(self.pages["Users"])
+        self._build_roles_page(self.pages["Roles"])
+        self._build_commands_page(self.pages["Commands"])
+        self._build_logs_page(self.pages["Logs"])
+        self.show_page("Dashboard")
 
-        ttk.Button(top, text="Start Bot", command=self.start_bot).grid(row=0, column=4, padx=4)
-        ttk.Button(top, text="Stop Bot", command=self.stop_bot).grid(row=0, column=5, padx=4)
-        ttk.Label(top, text="Theme:").grid(row=1, column=0, pady=(8, 0), sticky="w")
-        theme_combo = ttk.Combobox(
-            top,
-            textvariable=self.theme_var,
-            values=list(self.THEMES.keys()),
-            state="readonly",
-            width=14,
-        )
-        theme_combo.grid(row=1, column=1, sticky="w", padx=6, pady=(8, 0))
-        theme_combo.bind("<<ComboboxSelected>>", lambda _e: self.apply_theme(self.theme_var.get()))
-        top.columnconfigure(1, weight=1)
+    def _build_dashboard_page(self, page):
+        ttk.Label(page, text="Bot Token").pack(anchor="w")
+        row = ttk.Frame(page)
+        row.pack(fill="x", pady=4)
+        self.token_entry = ttk.Entry(row, textvariable=self.token_var, show="*")
+        self.token_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="👁", width=3, command=self.toggle_token).pack(side="left", padx=4)
+        ttk.Button(row, text="Start", command=self.start_bot).pack(side="left", padx=4)
+        ttk.Button(row, text="Emergency Lock", command=self.toggle_lock_mode).pack(side="left", padx=4)
+        ttk.Label(page, textvariable=self.status_var).pack(anchor="w", pady=6)
+        self.stats = ttk.Label(page, text="")
+        self.stats.pack(anchor="w")
 
-        mid = ttk.Frame(wrapper)
-        mid.pack(fill="both", expand=True)
-
-        left = ttk.LabelFrame(mid, text="Keys", padding=8)
-        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
-
-        ttk.Button(left, text="Load Keys File", command=self.load_keys).pack(anchor="w", pady=(0, 8))
-        ttk.Label(left, text="Default keys per request:").pack(anchor="w")
-        ttk.Entry(left, textvariable=self.default_count_var, width=10).pack(anchor="w", pady=(0, 8))
-        ttk.Button(left, text="Apply Default", command=self.apply_default_count).pack(anchor="w", pady=(0, 8))
-
-        self.keys_list = tk.Listbox(left)
+    def _build_keys_page(self, page):
+        bar = ttk.Frame(page)
+        bar.pack(fill="x", pady=(0, 6))
+        ttk.Entry(bar, textvariable=self.search_vars["keys"]).pack(side="left", fill="x", expand=True)
+        ttk.Button(bar, text="Load Keys", command=self.load_keys_with_preview).pack(side="left", padx=4)
+        ttk.Button(bar, text="Export Claims CSV", command=self.export_claims_csv).pack(side="left", padx=4)
+        self.keys_list = tk.Listbox(page)
         self.keys_list.pack(fill="both", expand=True)
 
-        right = ttk.LabelFrame(mid, text="Allowed Users", padding=8)
-        right.pack(side="left", fill="both", expand=True)
-
-        row = ttk.Frame(right)
-        row.pack(fill="x", pady=(0, 8))
-        ttk.Entry(row, textvariable=self.user_id_var).pack(side="left", fill="x", expand=True, padx=(0, 6))
-        ttk.Button(row, text="Add", command=self.add_user).pack(side="left", padx=3)
-        ttk.Button(row, text="Remove", command=self.remove_user).pack(side="left", padx=3)
-
-        self.users_list = tk.Listbox(right)
+    def _build_users_page(self, page):
+        top = ttk.Frame(page)
+        top.pack(fill="x")
+        self.user_input = tk.StringVar()
+        ttk.Entry(top, textvariable=self.user_input).pack(side="left", fill="x", expand=True)
+        ttk.Button(top, text="Add", command=self.add_user).pack(side="left", padx=4)
+        ttk.Button(top, text="Import Users File", command=self.import_users_file).pack(side="left", padx=4)
+        ttk.Button(top, text="Permission Test", command=self.permission_test).pack(side="left", padx=4)
+        ttk.Entry(page, textvariable=self.search_vars["users"]).pack(fill="x", pady=4)
+        self.users_list = tk.Listbox(page)
         self.users_list.pack(fill="both", expand=True)
+        ttk.Label(page, text="Claimed users (click for history)").pack(anchor="w")
+        ttk.Entry(page, textvariable=self.search_vars["claimed"]).pack(fill="x", pady=4)
+        self.claimed_list = tk.Listbox(page)
+        self.claimed_list.pack(fill="both", expand=True)
+        self.claimed_list.bind("<<ListboxSelect>>", self.show_claimed_history)
 
-        commands_frame = ttk.LabelFrame(mid, text="Custom Commands", padding=8)
-        commands_frame.pack(side="left", fill="both", expand=True, padx=(8, 0))
+    def _build_roles_page(self, page):
+        self.guild_combo = ttk.Combobox(page, state="readonly")
+        self.guild_combo.pack(fill="x")
+        self.guild_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_roles())
+        ttk.Entry(page, textvariable=self.search_vars["roles"]).pack(fill="x", pady=4)
+        self.show_allowed_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(page, text="Only show allowed roles", variable=self.show_allowed_only, command=self.refresh_roles).pack(anchor="w")
+        self.roles_list = tk.Listbox(page)
+        self.roles_list.pack(fill="both", expand=True)
 
-        ttk.Label(commands_frame, text="Command name (without prefix):").pack(anchor="w")
-        ttk.Entry(commands_frame, textvariable=self.command_name_var).pack(fill="x", pady=(0, 6))
-        ttk.Label(commands_frame, text="Reply message:").pack(anchor="w")
-        ttk.Entry(commands_frame, textvariable=self.command_response_var).pack(fill="x", pady=(0, 8))
-
-        command_buttons = ttk.Frame(commands_frame)
-        command_buttons.pack(fill="x", pady=(0, 8))
-        ttk.Button(command_buttons, text="Create / Update", command=self.add_or_update_command).pack(side="left", padx=(0, 6))
-        ttk.Button(command_buttons, text="Remove", command=self.remove_command).pack(side="left")
-
-        self.commands_list = tk.Listbox(commands_frame)
+    def _build_commands_page(self, page):
+        self.command_name = tk.StringVar()
+        self.command_reply = tk.StringVar()
+        ttk.Entry(page, textvariable=self.command_name).pack(fill="x")
+        ttk.Entry(page, textvariable=self.command_reply).pack(fill="x", pady=4)
+        ttk.Button(page, text="Save Command", command=self.save_command).pack(anchor="w")
+        ttk.Entry(page, textvariable=self.search_vars["commands"]).pack(fill="x", pady=4)
+        self.commands_list = tk.Listbox(page)
         self.commands_list.pack(fill="both", expand=True)
 
-        gained_frame = ttk.LabelFrame(mid, text="Users Who Gained Keys", padding=8)
-        gained_frame.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        self.gained_list = tk.Listbox(gained_frame)
-        self.gained_list.pack(fill="both", expand=True)
-
-        role_frame = ttk.LabelFrame(wrapper, text="Server Role Access", padding=8)
-        role_frame.pack(fill="both", expand=True, pady=(10, 0))
-        self.guild_notebook = ttk.Notebook(role_frame)
-        self.guild_notebook.pack(fill="both", expand=True)
-
-        bottom = ttk.LabelFrame(wrapper, text="State & Logs", padding=8)
-        bottom.pack(fill="both", expand=True, pady=(10, 0))
-
-        controls = ttk.Frame(bottom)
-        controls.pack(fill="x", pady=(0, 8))
-        ttk.Button(controls, text="Save State", command=self.save_state).pack(side="left", padx=(0, 6))
-        ttk.Button(controls, text="Load State", command=self.load_state).pack(side="left", padx=(0, 6))
-        self.stats_label = ttk.Label(controls, text="Remaining: 0 | Allowed: 0 | Claimed: 0")
-        self.stats_label.pack(side="right")
-
-        self.log_text = tk.Text(bottom, height=10, state="disabled")
+    def _build_logs_page(self, page):
+        self.log_text = tk.Text(page, state="disabled")
         self.log_text.pack(fill="both", expand=True)
 
-    def apply_theme(self, theme_name: str):
-        c = self.THEMES[theme_name]
-        self.style.theme_use("clam")
-        self.root.configure(bg=c["bg"])
+    def show_page(self, name):
+        self.pages[name].tkraise()
 
-        self.style.configure("TFrame", background=c["bg"])
-        self.style.configure("TLabelframe", background=c["panel"], bordercolor=c["border"], relief="solid")
-        self.style.configure("TLabelframe.Label", background=c["panel"], foreground=c["text"])
-        self.style.configure("TLabel", background=c["panel"], foreground=c["text"])
-        self.style.configure("TEntry", fieldbackground=c["input"], foreground=c["text"], bordercolor=c["border"])
-        self.style.map("TEntry", fieldbackground=[("readonly", c["input"])])
-        self.style.configure(
-            "TButton",
-            background=c["accent"],
-            foreground="white",
-            borderwidth=0,
-            focusthickness=0,
-            padding=6,
-        )
-        self.style.map("TButton", background=[("active", c["accent_active"])])
-        self.style.configure(
-            "TCombobox",
-            fieldbackground=c["input"],
-            background=c["input"],
-            foreground=c["text"],
-            arrowcolor=c["text"],
-        )
-        self.style.map("TCombobox", fieldbackground=[("readonly", c["input"])])
+    def toggle_token(self):
+        self.token_entry.configure(show="" if self.token_entry.cget("show") == "*" else "*")
 
-        for listbox in [self.keys_list, self.users_list, self.commands_list, self.gained_list]:
-            listbox.configure(
-                bg=c["input"],
-                fg=c["text"],
-                selectbackground=c["accent"],
-                selectforeground="white",
-                highlightthickness=1,
-                highlightbackground=c["border"],
-                relief="flat",
-            )
-
-        self.log_text.configure(
-            bg=c["input"],
-            fg=c["text"],
-            insertbackground=c["text"],
-            highlightthickness=1,
-            highlightbackground=c["border"],
-            relief="flat",
-        )
+    def set_status(self, text):
+        self.status_var.set(f"Status: {text}")
 
     def log(self, text: str):
         self.log_text.configure(state="normal")
         self.log_text.insert("end", text + "\n")
-        self.log_text.see("end")
         self.log_text.configure(state="disabled")
-        self.refresh_lists()
+        self.log_text.see("end")
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+        self.refresh_all()
 
-    def refresh_lists(self):
+    def auto_save(self):
+        self.dist.save_state(str(AUTOSAVE_PATH))
+
+    def refresh_all(self):
+        query_keys = self.search_vars["keys"].get().lower()
         self.keys_list.delete(0, "end")
-        for k in self.dist.keys:
-            self.keys_list.insert("end", k)
+        for key in self.dist.keys:
+            if query_keys in key.lower():
+                self.keys_list.insert("end", f"{key[:5]}-*****-{key[-5:]}")
 
+        query_users = self.search_vars["users"].get().lower()
         self.users_list.delete(0, "end")
         for uid in sorted(self.dist.allowed_users):
-            self.users_list.insert("end", str(uid))
+            label = f"{self.dist.username_cache.get(uid, 'Unknown')} ({uid})"
+            if query_users in label.lower():
+                self.users_list.insert("end", label)
+
+        query_claimed = self.search_vars["claimed"].get().lower()
+        self.claimed_list.delete(0, "end")
+        for uid, keys in self.dist.claimed.items():
+            label = f"{self.dist.username_cache.get(uid, 'Unknown')} ({uid}) - {len(keys)}"
+            if query_claimed in label.lower():
+                self.claimed_list.insert("end", label)
 
         self.commands_list.delete(0, "end")
-        for name, response in sorted(self.dist.custom_commands.items()):
-            self.commands_list.insert("end", f"{name} -> {response}")
+        for k, v in self.dist.custom_commands.items():
+            self.commands_list.insert("end", f"{k}: {v}")
 
-        self.gained_list.delete(0, "end")
-        for uid, keys in sorted(self.dist.claimed.items()):
-            if keys:
-                self.gained_list.insert("end", f"{uid} ({len(keys)} key(s))")
+        self.stats.configure(text=f"Remaining: {len(self.dist.keys)} | Allowed Users: {len(self.dist.allowed_users)} | Claimed: {sum(len(v) for v in self.dist.claimed.values())}")
+        self.refresh_roles()
 
-        s = self.dist.summary()
-        self.stats_label.config(
-            text=f"Remaining: {s['remaining']} | Allowed: {s['allowed_count']} | Claimed: {s['claimed_total']}"
-        )
-        self.refresh_guild_role_lists()
+    def sync_guilds(self, snapshots):
+        self.guild_data = {s.guild_name: s for s in snapshots}
+        self.guild_combo["values"] = list(self.guild_data.keys())
+        if snapshots and not self.guild_combo.get():
+            self.guild_combo.set(snapshots[0].guild_name)
+        self.refresh_roles()
 
-    def sync_guild_tabs(self, snapshots: list[GuildRoleSnapshot]):
-        def apply():
-            for tab_info in self.guild_tabs.values():
-                self.guild_notebook.forget(tab_info["frame"])
-            self.guild_tabs.clear()
-
-            for snapshot in sorted(snapshots, key=lambda s: s.guild_name.lower()):
-                frame = ttk.Frame(self.guild_notebook, padding=8)
-                self.guild_notebook.add(frame, text=snapshot.guild_name[:36])
-
-                listbox = tk.Listbox(frame)
-                listbox.pack(fill="both", expand=True, pady=(0, 8))
-
-                btn_row = ttk.Frame(frame)
-                btn_row.pack(fill="x")
-                ttk.Button(
-                    btn_row,
-                    text="Grant Selected Role",
-                    command=lambda gid=snapshot.guild_id, lb=listbox: self.grant_selected_role(gid, lb),
-                ).pack(side="left", padx=(0, 6))
-                ttk.Button(
-                    btn_row,
-                    text="Revoke Selected Role",
-                    command=lambda gid=snapshot.guild_id, lb=listbox: self.revoke_selected_role(gid, lb),
-                ).pack(side="left")
-
-                self.guild_tabs[snapshot.guild_id] = {
-                    "frame": frame,
-                    "listbox": listbox,
-                    "roles": snapshot.roles,
-                }
-            self.refresh_guild_role_lists()
-            self.apply_theme(self.theme_var.get())
-
-        self.root.after(0, apply)
-
-    def refresh_guild_role_lists(self):
-        for guild_id, info in self.guild_tabs.items():
-            listbox = info["listbox"]
-            listbox.delete(0, "end")
-            allowed = self.dist.allowed_roles_by_guild.get(guild_id, set())
-            for role_id, role_name in info["roles"]:
-                marker = "✅" if role_id in allowed else "❌"
-                listbox.insert("end", f"{marker} {role_name} ({role_id})")
-
-    def grant_selected_role(self, guild_id: int, listbox: tk.Listbox):
-        idx = listbox.curselection()
-        if not idx:
+    def refresh_roles(self):
+        self.roles_list.delete(0, "end")
+        selected = self.guild_combo.get()
+        if selected not in self.guild_data:
             return
-        role_id, role_name = self.guild_tabs[guild_id]["roles"][idx[0]]
-        self.dist.grant_role(guild_id, role_id)
-        self.log(f"Granted key access for role '{role_name}' in guild {guild_id}")
+        snap = self.guild_data[selected]
+        allowed = self.dist.server_settings[snap.guild_id].allowed_roles
+        q = self.search_vars["roles"].get().lower()
+        for role_id, name in snap.roles:
+            if q and q not in name.lower():
+                continue
+            marker = "✅" if role_id in allowed else "❌"
+            if self.show_allowed_only.get() and marker == "❌":
+                continue
+            self.roles_list.insert("end", f"{marker} {name} ({role_id})")
 
-    def revoke_selected_role(self, guild_id: int, listbox: tk.Listbox):
-        idx = listbox.curselection()
-        if not idx:
-            return
-        role_id, role_name = self.guild_tabs[guild_id]["roles"][idx[0]]
-        self.dist.revoke_role(guild_id, role_id)
-        self.log(f"Revoked key access for role '{role_name}' in guild {guild_id}")
-
-    def load_keys(self):
-        path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+    def load_keys_with_preview(self):
+        path = filedialog.askopenfilename(filetypes=[("Text", "*.txt")])
         if not path:
             return
-        try:
-            self.dist.load_keys_from_file(path)
-            self.log(f"Loaded keys from {path}")
-        except Exception as exc:
-            messagebox.showerror("Error", str(exc))
-
-    def apply_default_count(self):
-        try:
-            value = max(1, int(self.default_count_var.get()))
-            self.dist.default_count = value
-            self.log(f"Default key count set to {value}")
-        except ValueError:
-            messagebox.showwarning("Input Error", "Default count must be an integer.")
+        preview = self.dist.import_preview(path)
+        self.log(f"[Info] Import preview total={preview['total_lines']} empty_removed={preview['empty_removed']} duplicates_removed={preview['duplicates_removed']} final={preview['final_count']}")
+        self.dist.load_keys(preview["keys"])
+        self.auto_save()
+        self.refresh_all()
 
     def add_user(self):
         try:
-            uid = int(self.user_id_var.get().strip())
-            self.dist.add_allowed_user(uid)
-            self.log(f"Added allowed user {uid}")
+            self.dist.allowed_users.add(int(self.user_input.get().strip()))
+            self.auto_save()
+            self.refresh_all()
         except ValueError:
-            messagebox.showwarning("Input Error", "User ID must be a number.")
+            self.log("[Error] Invalid user ID")
 
-    def remove_user(self):
-        try:
-            uid = int(self.user_id_var.get().strip())
-            self.dist.remove_allowed_user(uid)
-            self.log(f"Removed allowed user {uid}")
-        except ValueError:
-            messagebox.showwarning("Input Error", "User ID must be a number.")
-
-    def save_state(self):
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+    def import_users_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Text/CSV", "*.txt *.csv")])
         if not path:
             return
-        try:
-            self.dist.save_state(path)
-            self.log(f"Saved state to {path}")
-        except Exception as exc:
-            messagebox.showerror("Error", str(exc))
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+        added, skipped = self.dist.load_allowed_users_from_lines(lines)
+        self.log(f"[Success] Imported allowed users. added={added}, skipped={skipped}")
+        self.auto_save()
 
-    def add_or_update_command(self):
-        try:
-            command_name = self.dist.upsert_custom_command(
-                self.command_name_var.get(),
-                self.command_response_var.get(),
-            )
-            self.controller.sync_custom_commands()
-            self.log(f"Saved custom command '{command_name}'")
-        except ValueError as exc:
-            messagebox.showwarning("Input Error", str(exc))
-
-    def remove_command(self):
-        removed = self.dist.remove_custom_command(self.command_name_var.get())
-        if removed:
-            self.controller.sync_custom_commands()
-            self.log(f"Removed custom command '{self.command_name_var.get().strip()}'")
+    def show_claimed_history(self, _evt):
+        sel = self.claimed_list.curselection()
+        if not sel:
             return
-        messagebox.showwarning("Not Found", "That command does not exist.")
+        raw = self.claimed_list.get(sel[0])
+        user_id = int(raw.split("(")[-1].split(")")[0])
+        events = [e for e in self.dist.claim_history if e.user_id == user_id]
+        self.log("[Info] Claim history for {}: {}".format(user_id, "; ".join([f"{e.key} @ {e.timestamp}" for e in events]) or "No history"))
 
-    def load_state(self):
-        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All files", "*.*")])
-        if not path:
-            return
+    def permission_test(self):
         try:
-            self.dist.load_state(path)
-            self.default_count_var.set(str(self.dist.default_count))
-            self.log(f"Loaded state from {path}")
-        except Exception as exc:
-            messagebox.showerror("Error", str(exc))
+            uid = int(self.user_input.get().strip())
+        except ValueError:
+            self.log("[Error] Enter user ID first")
+            return
+        selected = self.guild_combo.get()
+        gid = self.guild_data[selected].guild_id if selected in self.guild_data else 0
+        can, reason = self.dist.can_claim(uid, gid, [])
+        self.log(f"[Info] Permission test for {uid}: {'Yes' if can else 'No'} - {reason}")
+
+    def save_command(self):
+        name = self.command_name.get().strip()
+        if name:
+            self.dist.custom_commands[name] = self.command_reply.get().strip()
+            self.auto_save()
+            self.refresh_all()
+
+    def export_claims_csv(self):
+        out = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if not out:
+            return
+        with open(out, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow(["User ID", "Username", "Key", "Date Claimed"])
+            for e in self.dist.claim_history:
+                w.writerow([e.user_id, e.username, e.key, e.timestamp])
+        self.log(f"[Success] Exported claimed keys CSV to {out}")
 
     def start_bot(self):
         token = self.token_var.get().strip()
-        prefix = self.prefix_var.get().strip() or "!"
         if not token:
-            messagebox.showwarning("Missing Token", "Please enter your bot token.")
+            self.log("[Error] Missing token")
             return
-        self.controller.start(token, prefix)
+        self.controller.start(token, "!")
 
-    def stop_bot(self):
-        self.controller.stop()
+    def toggle_lock_mode(self):
+        self.dist.lock_mode = not self.dist.lock_mode
+        self.auto_save()
+        self.log(f"[Warning] Emergency lock mode {'enabled' if self.dist.lock_mode else 'disabled'}")
 
 
 def main():
