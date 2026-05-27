@@ -2,6 +2,7 @@ import asyncio
 import json
 import threading
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -10,11 +11,19 @@ import discord
 from discord.ext import commands
 
 
+@dataclass
+class GuildRoleSnapshot:
+    guild_id: int
+    guild_name: str
+    roles: list[tuple[int, str]]
+
+
 class KeyDistributor:
     def __init__(self):
         self.keys: list[str] = []
         self.claimed: dict[int, list[str]] = defaultdict(list)
         self.allowed_users: set[int] = set()
+        self.allowed_roles_by_guild: dict[int, set[int]] = defaultdict(set)
         self.default_count = 1
         self.custom_commands: dict[str, str] = {}
         self.lock = threading.Lock()
@@ -35,6 +44,9 @@ class KeyDistributor:
                 "default_count": self.default_count,
                 "custom_commands": self.custom_commands,
                 "claimed": {str(uid): vals for uid, vals in self.claimed.items()},
+                "allowed_roles_by_guild": {
+                    str(gid): sorted(role_ids) for gid, role_ids in self.allowed_roles_by_guild.items()
+                },
             }
         Path(file_path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -54,6 +66,10 @@ class KeyDistributor:
             for uid, vals in data.get("claimed", {}).items():
                 restored[int(uid)] = list(vals)
             self.claimed = restored
+            role_map = defaultdict(set)
+            for gid, role_ids in data.get("allowed_roles_by_guild", {}).items():
+                role_map[int(gid)] = {int(role_id) for role_id in role_ids}
+            self.allowed_roles_by_guild = role_map
 
     @staticmethod
     def _normalize_command_name(name: str) -> str:
@@ -84,10 +100,24 @@ class KeyDistributor:
         with self.lock:
             self.allowed_users.discard(user_id)
 
+    def grant_role(self, guild_id: int, role_id: int):
+        with self.lock:
+            self.allowed_roles_by_guild[guild_id].add(role_id)
+
+    def revoke_role(self, guild_id: int, role_id: int):
+        with self.lock:
+            roles = self.allowed_roles_by_guild.get(guild_id)
+            if not roles:
+                return
+            roles.discard(role_id)
+
+    def user_has_role_access(self, guild_id: int, role_ids: list[int]) -> bool:
+        with self.lock:
+            allowed_roles = self.allowed_roles_by_guild.get(guild_id, set())
+            return any(role_id in allowed_roles for role_id in role_ids)
+
     def give_keys(self, user_id: int, count: int | None = None) -> list[str]:
         with self.lock:
-            if user_id not in self.allowed_users:
-                return []
             n = count if count is not None else self.default_count
             n = max(1, n)
             if not self.keys:
@@ -107,9 +137,10 @@ class KeyDistributor:
 
 
 class BotController:
-    def __init__(self, distributor: KeyDistributor, log_cb):
+    def __init__(self, distributor: KeyDistributor, log_cb, guild_sync_cb):
         self.distributor = distributor
         self.log_cb = log_cb
+        self.guild_sync_cb = guild_sync_cb
         self.loop = None
         self.thread = None
         self.bot = None
@@ -124,16 +155,42 @@ class BotController:
         @bot.event
         async def on_ready():
             self.log_cb(f"Logged in as {bot.user} (ID: {bot.user.id})")
+            snapshots = []
+            for guild in bot.guilds:
+                me = guild.me
+                if me is None:
+                    continue
+                manageable_roles = [
+                    (role.id, role.name)
+                    for role in guild.roles
+                    if role.position < me.top_role.position and not role.managed
+                ]
+                manageable_roles.sort(key=lambda item: item[1].lower())
+                snapshots.append(
+                    GuildRoleSnapshot(
+                        guild_id=guild.id,
+                        guild_name=f"{guild.name} ({guild.id})",
+                        roles=manageable_roles,
+                    )
+                )
+            self.guild_sync_cb(snapshots)
 
         @bot.command(name="getkeys")
         async def get_keys(ctx, count: int | None = None):
             user_id = ctx.author.id
+            if isinstance(ctx.channel, discord.DMChannel) or ctx.guild is None:
+                await ctx.reply("Use this command inside a server channel.")
+                return
+
+            has_role_access = self.distributor.user_has_role_access(
+                ctx.guild.id, [role.id for role in ctx.author.roles]
+            )
+            if not has_role_access and user_id not in self.distributor.allowed_users:
+                await ctx.reply("You are not allowed to receive keys.")
+                return
             keys = self.distributor.give_keys(user_id, count)
             if not keys:
-                if user_id not in self.distributor.allowed_users:
-                    await ctx.reply("You are not allowed to receive keys.")
-                else:
-                    await ctx.reply("No keys are available right now.")
+                await ctx.reply("No keys are available right now.")
                 return
 
             joined = "\n".join(keys)
@@ -239,7 +296,7 @@ class Dashboard:
         self.style = ttk.Style(self.root)
 
         self.dist = KeyDistributor()
-        self.controller = BotController(self.dist, self.log)
+        self.controller = BotController(self.dist, self.log, self.sync_guild_tabs)
 
         self.token_var = tk.StringVar()
         self.prefix_var = tk.StringVar(value="!")
@@ -248,6 +305,7 @@ class Dashboard:
         self.command_name_var = tk.StringVar()
         self.command_response_var = tk.StringVar()
         self.theme_var = tk.StringVar(value="True Dark")
+        self.guild_tabs: dict[int, dict] = {}
 
         self._build_ui()
         self.apply_theme(self.theme_var.get())
@@ -326,6 +384,11 @@ class Dashboard:
         gained_frame.pack(side="left", fill="both", expand=True, padx=(8, 0))
         self.gained_list = tk.Listbox(gained_frame)
         self.gained_list.pack(fill="both", expand=True)
+
+        role_frame = ttk.LabelFrame(wrapper, text="Server Role Access", padding=8)
+        role_frame.pack(fill="both", expand=True, pady=(10, 0))
+        self.guild_notebook = ttk.Notebook(role_frame)
+        self.guild_notebook.pack(fill="both", expand=True)
 
         bottom = ttk.LabelFrame(wrapper, text="State & Logs", padding=8)
         bottom.pack(fill="both", expand=True, pady=(10, 0))
@@ -418,6 +481,68 @@ class Dashboard:
         self.stats_label.config(
             text=f"Remaining: {s['remaining']} | Allowed: {s['allowed_count']} | Claimed: {s['claimed_total']}"
         )
+        self.refresh_guild_role_lists()
+
+    def sync_guild_tabs(self, snapshots: list[GuildRoleSnapshot]):
+        def apply():
+            for tab_info in self.guild_tabs.values():
+                self.guild_notebook.forget(tab_info["frame"])
+            self.guild_tabs.clear()
+
+            for snapshot in sorted(snapshots, key=lambda s: s.guild_name.lower()):
+                frame = ttk.Frame(self.guild_notebook, padding=8)
+                self.guild_notebook.add(frame, text=snapshot.guild_name[:36])
+
+                listbox = tk.Listbox(frame)
+                listbox.pack(fill="both", expand=True, pady=(0, 8))
+
+                btn_row = ttk.Frame(frame)
+                btn_row.pack(fill="x")
+                ttk.Button(
+                    btn_row,
+                    text="Grant Selected Role",
+                    command=lambda gid=snapshot.guild_id, lb=listbox: self.grant_selected_role(gid, lb),
+                ).pack(side="left", padx=(0, 6))
+                ttk.Button(
+                    btn_row,
+                    text="Revoke Selected Role",
+                    command=lambda gid=snapshot.guild_id, lb=listbox: self.revoke_selected_role(gid, lb),
+                ).pack(side="left")
+
+                self.guild_tabs[snapshot.guild_id] = {
+                    "frame": frame,
+                    "listbox": listbox,
+                    "roles": snapshot.roles,
+                }
+            self.refresh_guild_role_lists()
+            self.apply_theme(self.theme_var.get())
+
+        self.root.after(0, apply)
+
+    def refresh_guild_role_lists(self):
+        for guild_id, info in self.guild_tabs.items():
+            listbox = info["listbox"]
+            listbox.delete(0, "end")
+            allowed = self.dist.allowed_roles_by_guild.get(guild_id, set())
+            for role_id, role_name in info["roles"]:
+                marker = "✅" if role_id in allowed else "❌"
+                listbox.insert("end", f"{marker} {role_name} ({role_id})")
+
+    def grant_selected_role(self, guild_id: int, listbox: tk.Listbox):
+        idx = listbox.curselection()
+        if not idx:
+            return
+        role_id, role_name = self.guild_tabs[guild_id]["roles"][idx[0]]
+        self.dist.grant_role(guild_id, role_id)
+        self.log(f"Granted key access for role '{role_name}' in guild {guild_id}")
+
+    def revoke_selected_role(self, guild_id: int, listbox: tk.Listbox):
+        idx = listbox.curselection()
+        if not idx:
+            return
+        role_id, role_name = self.guild_tabs[guild_id]["roles"][idx[0]]
+        self.dist.revoke_role(guild_id, role_id)
+        self.log(f"Revoked key access for role '{role_name}' in guild {guild_id}")
 
     def load_keys(self):
         path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
