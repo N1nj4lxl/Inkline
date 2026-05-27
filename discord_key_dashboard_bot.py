@@ -278,35 +278,54 @@ class BotController:
 class Dashboard:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Discord Key Distributor - Modern Dashboard")
-        self.root.geometry("1300x800")
+        self.root.title("Discord Key Distributor Dashboard")
+        self.root.geometry("1550x980")
+        self.root.configure(bg="#070b16")
         self.dist = KeyDistributor()
         self.status_var = tk.StringVar(value="Offline")
         self.token_var = tk.StringVar()
+        self.prefix_var = tk.StringVar(value="!")
         self.show_token_var = tk.BooleanVar(value=False)
         self.search_vars = {name: tk.StringVar() for name in ["keys", "users", "claimed", "roles", "commands"]}
         self.controller = BotController(self.dist, self.log, self.set_status, self.sync_guilds)
         self.guild_data = {}
+        self._setup_styles()
         self._build_ui()
         if AUTOSAVE_PATH.exists():
             self.dist.load_state(str(AUTOSAVE_PATH))
         self.refresh_all()
 
+    def _setup_styles(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Root.TFrame", background="#070b16")
+        style.configure("Panel.TFrame", background="#0d1427", relief="flat")
+        style.configure("Card.TFrame", background="#111a31", relief="flat")
+        style.configure("TLabel", background="#0d1427", foreground="#d5def3")
+        style.configure("Title.TLabel", font=("Segoe UI", 14, "bold"), foreground="#f0f5ff", background="#0d1427")
+        style.configure("Muted.TLabel", foreground="#90a2cb", background="#0d1427")
+        style.configure("TEntry", fieldbackground="#111a31", foreground="#f0f5ff", insertcolor="#f0f5ff")
+        style.configure("TButton", background="#3b45d9", foreground="#f4f6ff", padding=8)
+
     def _build_ui(self):
-        main = ttk.Frame(self.root, padding=10)
+        main = ttk.Frame(self.root, style="Root.TFrame", padding=10)
         main.pack(fill="both", expand=True)
-        sidebar = ttk.Frame(main, width=180)
+        sidebar = ttk.Frame(main, style="Panel.TFrame", width=190, padding=10)
         sidebar.pack(side="left", fill="y")
-        body = ttk.Frame(main)
-        body.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        body = ttk.Frame(main, style="Panel.TFrame", padding=10)
+        body.pack(side="left", fill="both", expand=True, padx=(8, 0))
+
+        ttk.Label(sidebar, text="Discord Key Distributor", style="Title.TLabel").pack(anchor="w", pady=(0, 10))
+        for name in ["Dashboard", "Keys", "Users", "Roles", "Commands", "Logs"]:
+            ttk.Button(sidebar, text=name, command=lambda n=name: self.show_page(n)).pack(fill="x", pady=4)
+        self.bot_status = ttk.Label(sidebar, text="Bot Status: Offline", style="Muted.TLabel")
+        self.bot_status.pack(side="bottom", anchor="w", pady=10)
 
         self.pages = {}
-        self.page_stack = ttk.Frame(body)
+        self.page_stack = ttk.Frame(body, style="Panel.TFrame")
         self.page_stack.pack(fill="both", expand=True)
-
         for name in ["Dashboard", "Keys", "Users", "Roles", "Commands", "Logs"]:
-            ttk.Button(sidebar, text=name, command=lambda n=name: self.show_page(n)).pack(fill="x", pady=3)
-            frame = ttk.Frame(self.page_stack)
+            frame = ttk.Frame(self.page_stack, style="Panel.TFrame")
             frame.place(relx=0, rely=0, relwidth=1, relheight=1)
             self.pages[name] = frame
 
@@ -319,66 +338,84 @@ class Dashboard:
         self.show_page("Dashboard")
 
     def _build_dashboard_page(self, page):
-        ttk.Label(page, text="Bot Token").pack(anchor="w")
-        row = ttk.Frame(page)
-        row.pack(fill="x", pady=4)
-        self.token_entry = ttk.Entry(row, textvariable=self.token_var, show="*")
-        self.token_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(row, text="👁", width=3, command=self.toggle_token).pack(side="left", padx=4)
-        ttk.Button(row, text="Start", command=self.start_bot).pack(side="left", padx=4)
-        ttk.Button(row, text="Emergency Lock", command=self.toggle_lock_mode).pack(side="left", padx=4)
-        ttk.Label(page, textvariable=self.status_var).pack(anchor="w", pady=6)
-        self.stats = ttk.Label(page, text="")
-        self.stats.pack(anchor="w")
+        top = ttk.Frame(page, style="Panel.TFrame")
+        top.pack(fill="x")
+        ttk.Label(top, text="Discord Key Distributor Dashboard", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
+
+        control = ttk.Frame(top, style="Card.TFrame", padding=10)
+        control.pack(fill="x")
+        ttk.Label(control, text="Bot Token").grid(row=0, column=0, sticky="w")
+        self.token_entry = ttk.Entry(control, textvariable=self.token_var, show="*")
+        self.token_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
+        ttk.Label(control, text="Prefix").grid(row=0, column=1, sticky="w")
+        ttk.Entry(control, textvariable=self.prefix_var, width=8).grid(row=1, column=1, sticky="ew", padx=(0, 8))
+        ttk.Button(control, text="👁", width=3, command=self.toggle_token).grid(row=1, column=2, padx=4)
+        ttk.Button(control, text="Start Bot", command=self.start_bot).grid(row=1, column=3, padx=4)
+        ttk.Button(control, text="Emergency Lock", command=self.toggle_lock_mode).grid(row=1, column=4, padx=4)
+        self.stats = ttk.Label(control, text="", style="Muted.TLabel")
+        self.stats.grid(row=2, column=0, columnspan=5, sticky="w", pady=(8, 0))
+        control.columnconfigure(0, weight=1)
 
     def _build_keys_page(self, page):
-        bar = ttk.Frame(page)
+        bar = ttk.Frame(page, style="Card.TFrame", padding=10)
         bar.pack(fill="x", pady=(0, 6))
-        ttk.Entry(bar, textvariable=self.search_vars["keys"]).pack(side="left", fill="x", expand=True)
-        ttk.Button(bar, text="Load Keys", command=self.load_keys_with_preview).pack(side="left", padx=4)
-        ttk.Button(bar, text="Export Claims CSV", command=self.export_claims_csv).pack(side="left", padx=4)
-        self.keys_list = tk.Listbox(page)
+        ttk.Label(bar, text="Keys", style="Title.TLabel").pack(anchor="w")
+        search = ttk.Frame(bar, style="Card.TFrame")
+        search.pack(fill="x", pady=6)
+        ttk.Entry(search, textvariable=self.search_vars["keys"]).pack(side="left", fill="x", expand=True)
+        ttk.Button(search, text="Load Keys", command=self.load_keys_with_preview).pack(side="left", padx=4)
+        ttk.Button(search, text="Export Claims CSV", command=self.export_claims_csv).pack(side="left", padx=4)
+        self.keys_list = tk.Listbox(page, bg="#0b1223", fg="#d8e5ff", highlightthickness=1, highlightbackground="#273760")
         self.keys_list.pack(fill="both", expand=True)
 
     def _build_users_page(self, page):
-        top = ttk.Frame(page)
+        top = ttk.Frame(page, style="Card.TFrame", padding=10)
         top.pack(fill="x")
         self.user_input = tk.StringVar()
         ttk.Entry(top, textvariable=self.user_input).pack(side="left", fill="x", expand=True)
-        ttk.Button(top, text="Add", command=self.add_user).pack(side="left", padx=4)
-        ttk.Button(top, text="Import Users File", command=self.import_users_file).pack(side="left", padx=4)
+        ttk.Button(top, text="Add User", command=self.add_user).pack(side="left", padx=4)
+        ttk.Button(top, text="Import Users", command=self.import_users_file).pack(side="left", padx=4)
         ttk.Button(top, text="Permission Test", command=self.permission_test).pack(side="left", padx=4)
-        ttk.Entry(page, textvariable=self.search_vars["users"]).pack(fill="x", pady=4)
-        self.users_list = tk.Listbox(page)
+        mid = ttk.Frame(page, style="Panel.TFrame")
+        mid.pack(fill="both", expand=True, pady=6)
+        left = ttk.Frame(mid, style="Card.TFrame", padding=8)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        ttk.Entry(left, textvariable=self.search_vars["users"]).pack(fill="x", pady=4)
+        self.users_list = tk.Listbox(left, bg="#0b1223", fg="#d8e5ff")
         self.users_list.pack(fill="both", expand=True)
-        ttk.Label(page, text="Claimed users (click for history)").pack(anchor="w")
-        ttk.Entry(page, textvariable=self.search_vars["claimed"]).pack(fill="x", pady=4)
-        self.claimed_list = tk.Listbox(page)
+        right = ttk.Frame(mid, style="Card.TFrame", padding=8)
+        right.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        ttk.Entry(right, textvariable=self.search_vars["claimed"]).pack(fill="x", pady=4)
+        self.claimed_list = tk.Listbox(right, bg="#0b1223", fg="#d8e5ff")
         self.claimed_list.pack(fill="both", expand=True)
         self.claimed_list.bind("<<ListboxSelect>>", self.show_claimed_history)
 
     def _build_roles_page(self, page):
-        self.guild_combo = ttk.Combobox(page, state="readonly")
+        top = ttk.Frame(page, style="Card.TFrame", padding=10)
+        top.pack(fill="x")
+        self.guild_combo = ttk.Combobox(top, state="readonly")
         self.guild_combo.pack(fill="x")
         self.guild_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_roles())
-        ttk.Entry(page, textvariable=self.search_vars["roles"]).pack(fill="x", pady=4)
+        ttk.Entry(top, textvariable=self.search_vars["roles"]).pack(fill="x", pady=6)
         self.show_allowed_only = tk.BooleanVar(value=False)
-        ttk.Checkbutton(page, text="Only show allowed roles", variable=self.show_allowed_only, command=self.refresh_roles).pack(anchor="w")
-        self.roles_list = tk.Listbox(page)
-        self.roles_list.pack(fill="both", expand=True)
+        ttk.Checkbutton(top, text="Only show allowed roles", variable=self.show_allowed_only, command=self.refresh_roles).pack(anchor="w")
+        self.roles_list = tk.Listbox(page, bg="#0b1223", fg="#d8e5ff")
+        self.roles_list.pack(fill="both", expand=True, pady=6)
 
     def _build_commands_page(self, page):
+        wrap = ttk.Frame(page, style="Card.TFrame", padding=10)
+        wrap.pack(fill="both", expand=True)
         self.command_name = tk.StringVar()
         self.command_reply = tk.StringVar()
-        ttk.Entry(page, textvariable=self.command_name).pack(fill="x")
-        ttk.Entry(page, textvariable=self.command_reply).pack(fill="x", pady=4)
-        ttk.Button(page, text="Save Command", command=self.save_command).pack(anchor="w")
-        ttk.Entry(page, textvariable=self.search_vars["commands"]).pack(fill="x", pady=4)
-        self.commands_list = tk.Listbox(page)
+        ttk.Entry(wrap, textvariable=self.command_name).pack(fill="x")
+        ttk.Entry(wrap, textvariable=self.command_reply).pack(fill="x", pady=4)
+        ttk.Button(wrap, text="Save Command", command=self.save_command).pack(anchor="w")
+        ttk.Entry(wrap, textvariable=self.search_vars["commands"]).pack(fill="x", pady=4)
+        self.commands_list = tk.Listbox(wrap, bg="#0b1223", fg="#d8e5ff")
         self.commands_list.pack(fill="both", expand=True)
 
     def _build_logs_page(self, page):
-        self.log_text = tk.Text(page, state="disabled")
+        self.log_text = tk.Text(page, state="disabled", bg="#0b1223", fg="#e0ebff", insertbackground="#ffffff")
         self.log_text.pack(fill="both", expand=True)
 
     def show_page(self, name):
@@ -389,6 +426,8 @@ class Dashboard:
 
     def set_status(self, text):
         self.status_var.set(f"Status: {text}")
+        if hasattr(self, "bot_status"):
+            self.bot_status.configure(text=f"Bot Status: {text}")
 
     def log(self, text: str):
         self.log_text.configure(state="normal")
@@ -424,10 +463,13 @@ class Dashboard:
                 self.claimed_list.insert("end", label)
 
         self.commands_list.delete(0, "end")
+        q_commands = self.search_vars["commands"].get().lower()
         for k, v in self.dist.custom_commands.items():
-            self.commands_list.insert("end", f"{k}: {v}")
+            row = f"{k}: {v}"
+            if q_commands in row.lower():
+                self.commands_list.insert("end", row)
 
-        self.stats.configure(text=f"Remaining: {len(self.dist.keys)} | Allowed Users: {len(self.dist.allowed_users)} | Claimed: {sum(len(v) for v in self.dist.claimed.values())}")
+        self.stats.configure(text=f"{self.status_var.get()}  |  Keys: {len(self.dist.keys)}  |  Users: {len(self.dist.allowed_users)}  |  Claims: {sum(len(v) for v in self.dist.claimed.values())}")
         self.refresh_roles()
 
     def sync_guilds(self, snapshots):
@@ -523,13 +565,12 @@ class Dashboard:
         if not token:
             self.log("[Error] Missing token")
             return
-        self.controller.start(token, "!")
+        self.controller.start(token, self.prefix_var.get().strip() or "!")
 
     def toggle_lock_mode(self):
         self.dist.lock_mode = not self.dist.lock_mode
         self.auto_save()
         self.log(f"[Warning] Emergency lock mode {'enabled' if self.dist.lock_mode else 'disabled'}")
-
 
 def main():
     root = tk.Tk()
